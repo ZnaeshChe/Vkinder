@@ -1,10 +1,21 @@
-user_token = '' # токен пользователя
-comm_token = '' # токен сообщества
+"""
+Файл, содержащий необходимые переменные
+"""
 
-offset = 0 #сдвиг
-line = range(0, 1000) # последовательность для перебора найденных пользователей
+import configparser
 
-host = '127.0.0.1'
-user = 'postgres'
-password = '0000'
-db_name = 'bot_users'
+# Объект парсера
+config = configparser.ConfigParser()
+
+if len(config.read("settings.ini")) == 0:
+    print('Добавьте файл setings.ini\nПример файла -> example/settings.ini')
+    exit()
+
+# Токен пользователя
+USER_TOKEN = config.get("settings", "user_token")
+# Токен группы
+GROUP_TOKEN = config.get("settings", "group_token")
+# Файл для логгирования
+LOGGING_FILE = config.get("settings", "logging_file")
+# База данных
+CONNSTR = config.get("database", "connstr")
