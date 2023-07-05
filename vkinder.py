@@ -3,6 +3,8 @@
 """
 # pylint: disable = import-error, invalid-name, line-too-long
 import logging
+import sys
+
 import vk_api
 
 from vk_api.exceptions import ApiError
@@ -41,15 +43,16 @@ class VKinder:
             return None
         return session
 
-    def search_users(self, age, gender, city, status, count=1000):
+    def search_users(self, age, gender, city, status, count=50, offset=0):
         """
         Поиск по критериям
-        :param age: Возраст
+        :param age:    Возраст
         :param gender: Пол
-        :param city: Город
+        :param city:   Город
         :param status: Семейное положение
-        :param count: Количество пользователей
-        :return: Список пользователей
+        :param count:  Количество пользователей
+        :param offset: Смещение
+        :return:       Список пользователей
         """
         api = self.session.get_api()
 
@@ -61,11 +64,12 @@ class VKinder:
                 sex=gender,
                 city=city,
                 status=status,
+                offset=offset,
                 fields="photo_id"
             )
         except vk_api.exceptions.ApiError as e:
             logging.error(f"Ошибка при поиске пользователей: {e}")
-            return []
+            return None
 
         return users["items"]
 
@@ -102,7 +106,14 @@ class VKinder:
                 photos["items"], key=lambda x: x["likes"]["count"], reverse=True
             )
             # Возвращаем топ n фото
-            return popular_photos[:top_count]
+            top_photos = popular_photos[:top_count]
+            # Получаем фото, где пользователь отмечен
+            tagged_photos = [photo for photo in photos["items"] if photo.get("tags")]
+            # Сортируем по популярности
+            tagged_photos = sorted(tagged_photos, key=lambda x: x["likes"]["count"], reverse=True)
+            # Добавляем к топ-фото
+            top_photos += tagged_photos[:top_count - len(top_photos)]
+            return top_photos
         except vk_api.exceptions.ApiError as e:
             logging.error(f"Ошибка при получении фото пользователя: {e}")
             return None
@@ -118,11 +129,18 @@ class VKinderBot:
         self.vkinder = None
 
         # Количество сохраняемых пользователей за один поиск
-        self.top_users = 2
+        self.top_users = 5
 
         # Кэш локальный и базы данных
         self.user_data_cache = {}
         self.user_data = Saver(**kwargs)
+
+        token = VK_USER_TOKEN
+        try:
+            self.vkinder = VKinder(token)
+        except Exception as error:
+            logging.error(error)
+            sys.exit(1)
 
         # Состояния при работе с пользователем
         self.step_handlers = {
@@ -195,23 +213,6 @@ class VKinderBot:
         self.send_message(user_id, messages.process_status)
         return "status"
 
-    def final_status(self, user_id, *args):
-        """
-        Финальный статус
-        :param user_id: Id пользователя
-        :return:        Статус пользователя в боте
-        """
-        # Если есть пользователи в базе
-        if 'profiles' in self.user_data_cache[user_id]:
-            profiles_id = [profile['id'] for profile in self.user_data_cache[user_id]['profiles']]
-            # Сохраняем результаты в бд
-            self.user_data.save_session_to_db(user_id, profiles_id)
-
-            # Добавим список найденных пользователей, чтобы не обращаться заново к базе
-            self.user_data_cache[user_id]['in_db'].extend(profiles_id)
-        self.send_message(user_id, messages.final_status)
-        return "final"
-
     def get_next_profile(self, user_id):
         """
         Возвращает следующую анкету из сохраненных для данного пользователя.
@@ -220,7 +221,24 @@ class VKinderBot:
         :return: dict, информация об анкете или None, если анкеты закончились.
         """
         if not self.user_data_cache[user_id].get('profiles'):
-            return None
+            age, gender, city, status = (
+                self.user_data_cache[user_id]["age"],
+                self.user_data_cache[user_id]["gender"],
+                self.user_data_cache[user_id]["city"],
+                self.user_data_cache[user_id]["status"],
+            )
+
+            self.user_data_cache[user_id]["offset"] += self.top_users
+            try:
+                users = self.vkinder.search_users(age, gender, city, status,
+                                                  offset=self.user_data_cache[user_id]["offset"])
+            except ApiError:
+                self.send_message(user_id, messages.session_error)
+                return None
+            self.user_data_cache[user_id]['profiles'] = [user for user in users if
+                                                         not user.get('is_closed', True) and user['id'] not in
+                                                         self.user_data_cache[user_id]['in_db']][
+                                                        :self.top_users]
         return self.user_data_cache[user_id]['profiles'].pop(-1)
 
     def process_message(self, event):
@@ -235,6 +253,9 @@ class VKinderBot:
             self.initialize_user_data(event.user_id)
             current_step = None
         else:
+            if event.text.lower() == 'избранное':
+                self.handle_favorites(event.user_id)
+                return
             current_step = current_data['step']
 
         self.handle_current_step(event.user_id, event.text, current_step)
@@ -246,10 +267,9 @@ class VKinderBot:
         :param user_id: ID пользователя
         """
         # Инициализация в кэше
-        self.user_data_cache[user_id] = {'step': None}
+        self.user_data_cache[user_id] = {'step': None, 'offset': 0, 'last': None, 'favorites': []}
         # Поиск в базе данных
         self.user_data_cache[user_id]['in_db'] = self.user_data.get_user_data_from_db(user_id)
-
         # Отправим приветствие
         greet_message = messages.greet_again if self.user_data_cache[user_id]['in_db'] else messages.greet_status
         self.send_message(user_id, greet_message)
@@ -276,12 +296,24 @@ class VKinderBot:
 
         self.user_data_cache[user_id]['step'] = next_step
 
+    def handle_favorites(self, user_id):
+        users = self.user_data_cache[user_id]['favorites']
+        if users:
+            self.send_message(user_id, '\n'.join([messages.favorites,
+                                                 '\n'.join(users)]))
+        else:
+            self.send_message(user_id, messages.no_favorites)
+
     def handle_final_step(self, user_id, text, _):
         if text.lower() == "еще":
             next_profile = self.get_next_profile(user_id)
             if next_profile:
+                link = f"https://vk.com/id{next_profile['id']}"
+                self.user_data_cache[user_id]['last'] = link
+                self.user_data.save_session_to_db(user_id, [next_profile["id"]])
+                self.user_data_cache[user_id]['in_db'].append(next_profile["id"])
                 top_photos = self.vkinder.get_top_photos(next_profile["id"])
-                self.send_photos_and_link(user_id, top_photos, f"https://vk.com/id{next_profile['id']}")
+                self.send_photos_and_link(user_id, top_photos, link)
                 return "final"
             else:
                 self.send_message(user_id, messages.final_again)
@@ -290,6 +322,10 @@ class VKinderBot:
             self.send_message(user_id, '\n'.join([messages.final_user_again,
                                                   messages.process_age]))
             return "age"
+        elif text.lower() == "в избранное":
+            self.send_message(user_id, 'Добавил в избранное!')
+            self.user_data_cache[user_id]['favorites'].append(self.user_data_cache[user_id]['last'])
+            return "final"
         else:
             self.send_message(user_id, messages.some_error)
             return "final"
@@ -303,11 +339,6 @@ class VKinderBot:
                 self.user_data_cache[user_id]["city"],
                 self.user_data_cache[user_id]["status"],
             )
-            token = VK_USER_TOKEN
-            if not token:
-                self.send_message(user_id, messages.session_error)
-                return current_step
-            self.vkinder = VKinder(token)
             try:
                 users = self.vkinder.search_users(age, gender, city, status)
             except ApiError:
@@ -321,11 +352,18 @@ class VKinderBot:
             # Отправляем первую анкету, если она есть
             next_profile = self.get_next_profile(user_id)
             if next_profile:
+                link = f"https://vk.com/id{next_profile['id']}"
+                self.user_data_cache[user_id]['last'] = link
+                self.user_data.save_session_to_db(user_id, [next_profile["id"]])
+                self.user_data_cache[user_id]['in_db'].append(next_profile["id"])
                 top_photos = self.vkinder.get_top_photos(next_profile["id"])
-                self.send_photos_and_link(user_id, top_photos, f"https://vk.com/id{next_profile['id']}")
+                self.send_photos_and_link(user_id, top_photos, link)
+
             else:
                 self.send_message(user_id, messages.final_status)
-            return self.final_status(user_id)
+
+            self.send_message(user_id, messages.final_status)
+            return "final"
         else:
             self.send_message(user_id, messages.incorrect_data)
             return current_step
@@ -363,7 +401,7 @@ class VKinderBot:
         if step == "status":
             return text in ("1", "2", "3", "4", "5")
         if step == "final":
-            return text.lower() in ['заново', 'еще']
+            return text.lower() in ['заново', 'еще', 'в избранное']
         if step == "again":
             return text.lower() == 'заново'
         return False
